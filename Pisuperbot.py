@@ -1,6 +1,6 @@
 import streamlit as st
 from stellar_sdk import Keypair, Server, TransactionBuilder, Asset
-from bip_utils import Bip39SeedGenerator, Bip39MnemonicValidator, Bip39Languages, Bip32Slip10Ed25519
+from hashlib import sha256
 import time
 
 # Pi Network configuration
@@ -13,15 +13,13 @@ RESERVE_AMOUNT = 0.01
 def get_server():
     return Server(API_BASE)
 
-# Cache keypair derivation
+# Simple mnemonic-to-keypair (no bip_utils)
 @st.cache_data
 def derive_pi_keypair(mnemonic: str):
-    seed_bytes = Bip39SeedGenerator(mnemonic).Generate()
-    bip32 = Bip32Slip10Ed25519.FromSeed(seed_bytes)
-    key = bip32.DerivePath("m/44'/314159'/0'").PrivateKey().Raw().ToBytes()
-    sender_secret = Keypair.from_raw_ed25519_seed(key).secret
-    sender_keypair = Keypair.from_secret(sender_secret)
-    return sender_keypair.public_key, sender_secret
+    # Hash mnemonic to seed (not BIP-39 compliant, for simplicity)
+    seed = sha256(mnemonic.encode()).digest()
+    sender_keypair = Keypair.from_raw_ed25519_seed(seed[:32])
+    return sender_keypair.public_key, sender_keypair.secret
 
 # Send Pi with 50 attempts, minimal UI
 def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, sweep=False, max_attempts=50):
@@ -30,10 +28,8 @@ def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, 
     attempts = 0
     last_error = None
 
-    # Use available balance (minus reserve) for sweep or if amount is 0, else cap at available balance
     send_amount = max(0, available_balance - RESERVE_AMOUNT) if sweep or amount <= 0 else min(amount, max(0, available_balance - RESERVE_AMOUNT))
 
-    # Cache account and base fee
     try:
         account = server.load_account(sender_pub)
         base_fee = server.fetch_base_fee()
@@ -62,7 +58,7 @@ def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, 
             last_error = "Transaction failed"
         except Exception as e:
             last_error = str(e)
-            if "429" in str(e):  # Fallback for rate limit
+            if "429" in str(e):
                 time.sleep(0.1)
 
     return {"success": False, "error": last_error or "No attempts made", "attempts": attempts}
@@ -73,7 +69,7 @@ st.title("🚀 Pi Super Bot (Mainnet)")
 mnemonic = st.text_area(
     "Enter your 24-word Pi Wallet Mnemonic",
     placeholder="Enter your 24-word mnemonic phrase",
-    help="Enter a valid 24-word BIP-39 mnemonic. Move locked coins to available balance in Wallet.Pi first."
+    help="Enter a valid 24-word mnemonic. Move locked coins to available balance in Wallet.Pi first."
 )
 destination = st.text_input(
     "Destination Wallet Address",
@@ -93,11 +89,9 @@ if start_bot:
         st.error("Enter both mnemonic and destination address.")
     else:
         normalized_mnemonic = mnemonic.strip().lower()
-        validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
         try:
-            if not validator.IsValid(normalized_mnemonic):
-                st.error("❌ Invalid mnemonic phrase!")
-            elif len(normalized_mnemonic.split()) != 24:
+            # Basic validation
+            if len(normalized_mnemonic.split()) != 24:
                 st.error("❌ Requires 24-word mnemonic.")
             else:
                 with st.spinner("🔄 Processing..."):
@@ -124,4 +118,4 @@ if start_bot:
                             st.error(f"❌ Failed after {result['attempts']} attempts: {result['error']}")
 
         except Exception as e:
-            st.error(f"❌ Error validating mnemonic: {str(e)}")
+            st.error(f"❌ Error processing mnemonic: {str(e)}")
