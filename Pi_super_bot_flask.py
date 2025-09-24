@@ -1,27 +1,27 @@
-import streamlit as st
+from flask import Flask, request, jsonify, render_template_string
 from stellar_sdk import Keypair, Server, TransactionBuilder, Asset
-from hashlib import sha256
+from bip_utils import Bip39SeedGenerator, Bip39MnemonicValidator, Bip39Languages, Bip32Slip10Ed25519
 import time
+import os
+
+app = Flask(__name__)
 
 # Pi Network configuration
-NETWORK_PASSPHRASE = "Pi Network"  # Verify at developers.pi.network
+NETWORK_PASSPHRASE = "Pi Network"
 API_BASE = "https://api.mainnet.minepi.com"
 RESERVE_AMOUNT = 0.01
 
-# Cache Server instance
-@st.cache_resource
 def get_server():
     return Server(API_BASE)
 
-# Simple mnemonic-to-keypair (no bip_utils)
-@st.cache_data
 def derive_pi_keypair(mnemonic: str):
-    # Hash mnemonic to seed (not BIP-39 compliant, for simplicity)
-    seed = sha256(mnemonic.encode()).digest()
-    sender_keypair = Keypair.from_raw_ed25519_seed(seed[:32])
-    return sender_keypair.public_key, sender_keypair.secret
+    seed_bytes = Bip39SeedGenerator(mnemonic).Generate()
+    bip32 = Bip32Slip10Ed25519.FromSeed(seed_bytes)
+    key = bip32.DerivePath("m/44'/314159'/0'").PrivateKey().Raw().ToBytes()
+    sender_secret = Keypair.from_raw_ed25519_seed(key).secret
+    sender_keypair = Keypair.from_secret(sender_secret)
+    return sender_keypair.public_key, sender_secret
 
-# Send Pi with 50 attempts, minimal UI
 def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, sweep=False, max_attempts=50):
     server = get_server()
     sender_kp = Keypair.from_secret(sender_secret)
@@ -38,6 +38,7 @@ def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, 
 
     while attempts < max_attempts:
         attempts += 1
+        print(f"Attempts: {attempts}/50")
         try:
             if send_amount <= 0:
                 return {"success": False, "error": "Amount too small or insufficient balance", "attempts": attempts}
@@ -63,59 +64,90 @@ def send_pi(sender_pub, sender_secret, dest_address, amount, available_balance, 
 
     return {"success": False, "error": last_error or "No attempts made", "attempts": attempts}
 
-# Streamlit interface
-st.title("🚀 Pi Super Bot (Mainnet)")
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        mnemonic = request.form.get('mnemonic', '').strip().lower()
+        destination = request.form.get('destination', '')
+        amount = float(request.form.get('amount', 0) or 0)
+        sweep = request.form.get('sweep', 'off') == 'on'
 
-mnemonic = st.text_area(
-    "Enter your 24-word Pi Wallet Mnemonic",
-    placeholder="Enter your 24-word mnemonic phrase",
-    help="Enter a valid 24-word mnemonic. Move locked coins to available balance in Wallet.Pi first."
-)
-destination = st.text_input(
-    "Destination Wallet Address",
-    placeholder="Enter a valid Pi address (starts with G...)"
-)
-amount_input = st.number_input(
-    "Amount to Send (leave 0 for available balance)",
-    value=0.0,
-    step=0.01,
-    min_value=0.0
-)
-sweep_wallet = st.checkbox("Sweep Wallet (send all available balance, leave 0.01 PI)")
-start_bot = st.button("Start Pi Bot")
+        validator = Bip39MnemonicValidator(Bip39Languages.ENGLISH)
+        if not validator.IsValid(mnemonic) or len(mnemonic.split()) != 24:
+            return render_template_string(HTML_TEMPLATE, error="Invalid mnemonic phrase", output="")
 
-if start_bot:
-    if not mnemonic or not destination:
-        st.error("Enter both mnemonic and destination address.")
-    else:
-        normalized_mnemonic = mnemonic.strip().lower()
         try:
-            # Basic validation
-            if len(normalized_mnemonic.split()) != 24:
-                st.error("❌ Requires 24-word mnemonic.")
-            else:
-                with st.spinner("🔄 Processing..."):
-                    pub_key, secret = derive_pi_keypair(normalized_mnemonic)
-                    server = get_server()
-                    try:
-                        account = server.accounts().account_id(pub_key).call()
-                        balances = {bal['asset_type']: float(bal['balance']) for bal in account['balances']}
-                        available_balance = balances.get("native", 0.0)
-                        st.info(f"Available Pi balance: {available_balance} PI")
-                    except Exception as e:
-                        st.error(f"❌ Failed to load account: {str(e)}")
-                        st.stop()
-
-                    send_amount = amount_input
-                    with st.spinner(f"🔄 Sending {'all available' if sweep_wallet or send_amount <= 0 else send_amount} PI to {destination} (50 attempts)..."):
-                        start_time = time.time()
-                        result = send_pi(pub_key, secret, destination, send_amount, available_balance, sweep=sweep_wallet)
-                        end_time = time.time()
-                        st.info(f"Attempts: {result['attempts']}/50 | Time: {end_time - start_time:.2f}s")
-                        if result["success"]:
-                            st.success(f"✅ Sent {result['amount']} PI! TX Hash: {result['txHash']}")
-                        else:
-                            st.error(f"❌ Failed after {result['attempts']} attempts: {result['error']}")
-
+            pub_key, secret = derive_pi_keypair(mnemonic)
+            server = get_server()
+            account = server.accounts().account_id(pub_key).call()
+            balances = {bal['asset_type']: float(bal['balance']) for bal in account['balances']}
+            available_balance = balances.get("native", 0.0)
         except Exception as e:
-            st.error(f"❌ Error processing mnemonic: {str(e)}")
+            return render_template_string(HTML_TEMPLATE, error=f"Failed to load account: {str(e)}", output="")
+
+        start_time = time.time()
+        result = send_pi(pub_key, secret, destination, amount, available_balance, sweep=sweep)
+        end_time = time.time()
+
+        output = f"Available Pi balance: {available_balance} PI\n"
+        output += f"Sending {'all available' if sweep or amount <= 0 else amount} PI to {destination} (50 attempts)...\n"
+        output += f"Attempts: {result['attempts']}/50 | Time: {end_time - start_time:.2f}s\n"
+        if result["success"]:
+            output += f"✅ Sent {result['amount']} PI! TX Hash: {result['txHash']}"
+        else:
+            output += f"❌ Failed after {result['attempts']} attempts: {result['error']}"
+
+        return render_template_string(HTML_TEMPLATE, error="", output=output)
+
+    return render_template_string(HTML_TEMPLATE, error="", output="")
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pi Super Bot</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input, textarea { width: 100%; padding: 8px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .output { margin-top: 20px; white-space: pre-wrap; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <h1>🚀 Pi Super Bot (Mainnet)</h1>
+    <form method="POST">
+        <div class="form-group">
+            <label for="mnemonic">Enter your 24-word Pi Wallet Mnemonic</label>
+            <textarea id="mnemonic" name="mnemonic" placeholder="Enter your 24-word mnemonic phrase" rows="4" required></textarea>
+        </div>
+        <div class="form-group">
+            <label for="destination">Destination Wallet Address</label>
+            <input id="destination" name="destination" placeholder="Enter a valid Pi address (starts with G...)" required>
+        </div>
+        <div class="form-group">
+            <label for="amount">Amount to Send (leave 0 for available balance)</label>
+            <input id="amount" name="amount" type="number" step="0.01" min="0" value="0">
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" name="sweep"> Sweep Wallet (send all available balance, leave 0.01 PI)</label>
+        </div>
+        <button type="submit">Start Pi Bot</button>
+    </form>
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% endif %}
+    {% if output %}
+        <div class="output">{{ output }}</div>
+    {% endif %}
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
