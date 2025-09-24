@@ -1,2 +1,2 @@
 streamlit==1.31.0
-stellar-sdk==8.0.0
+stellar-sdk==7.0.0
