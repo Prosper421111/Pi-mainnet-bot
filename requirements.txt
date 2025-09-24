@@ -1,4 +1,2 @@
 streamlit==1.31.0
-bip_utils==2.7.0
 stellar-sdk==8.0.0
-cryptography==38.0.4
